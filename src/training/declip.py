@@ -86,7 +86,14 @@ class DeCLIP:
         if args.use_dcac and images_view1 is not None:
             patch_feat1 = self._encode_patch_tokens(student, images_view1)
             patch_feat2 = self._encode_patch_tokens(student, images_view2)
-            loss_dcac = compute_dcac_loss(patch_feat1, patch_feat2, overlap_meta, temp=args.dcac_temp)
+            loss_dcac = compute_dcac_loss(
+                patch_feat1,
+                patch_feat2,
+                overlap_meta,
+                temp=args.dcac_temp,
+                pos_thresh=args.dcac_pos_thresh,
+                neg_mode=args.dcac_neg_mode,
+            )
             losses.update({"loss_dcac": loss_dcac * args.dcac_weight})
         return losses, len(images)
 
