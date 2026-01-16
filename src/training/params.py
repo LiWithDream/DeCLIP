@@ -119,17 +119,6 @@ def parse_args(args):
         default=0.1,
     )
     parser.add_argument(
-        "--dcac-pos-thresh",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--dcac-neg-mode",
-        type=str,
-        default="all",
-        choices=["all", "cross_image"],
-    )
-    parser.add_argument(
         "--overlap-min-iou",
         type=float,
         default=0.2,

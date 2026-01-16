@@ -3,25 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from training.misc import is_main_process
 from training.dcac_loss import compute_dcac_loss
+import torch
 
 
 class DeCLIP:
     def _encode_patch_tokens(self, model, images):
         visual = model.visual if hasattr(model, "visual") else model.vision_model
-        patch_dropout = getattr(visual, "patch_dropout", None)
-        if patch_dropout is not None and not isinstance(patch_dropout, nn.Identity):
-            visual.patch_dropout = nn.Identity()
-            try:
-                tokens = visual(images, return_all_features=True)
-            except TypeError:
-                tokens = visual.forward(images, return_all_features=True)
-            finally:
-                visual.patch_dropout = patch_dropout
-        else:
-            try:
-                tokens = visual(images, return_all_features=True)
-            except TypeError:
-                tokens = visual.forward(images, return_all_features=True)
+        try:
+            tokens = visual(images, return_all_features=True)
+        except TypeError:
+            tokens = visual.forward(images, return_all_features=True)
         if tokens.dim() != 3:
             raise ValueError("Expected token sequence output for DCAC features.")
         tokens = tokens[:, 1:, :]
@@ -86,14 +77,7 @@ class DeCLIP:
         if args.use_dcac and images_view1 is not None:
             patch_feat1 = self._encode_patch_tokens(student, images_view1)
             patch_feat2 = self._encode_patch_tokens(student, images_view2)
-            loss_dcac = compute_dcac_loss(
-                patch_feat1,
-                patch_feat2,
-                overlap_meta,
-                temp=args.dcac_temp,
-                pos_thresh=args.dcac_pos_thresh,
-                neg_mode=args.dcac_neg_mode,
-            )
+            loss_dcac = compute_dcac_loss(patch_feat1, patch_feat2, overlap_meta, temp=args.dcac_temp)
             losses.update({"loss_dcac": loss_dcac * args.dcac_weight})
         return losses, len(images)
 

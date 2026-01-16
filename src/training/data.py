@@ -284,8 +284,6 @@ class GridDistillDataset(Dataset):
         return int(output_size)
 
     def _get_patch_size(self):
-        if getattr(self.args, "dcac_patch_size", None):
-            return int(self.args.dcac_patch_size)
         model_name = getattr(self.args, "model", "").lower()
         if "16" in model_name:
             return 16
