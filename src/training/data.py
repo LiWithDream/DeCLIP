@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import math
 from dataclasses import dataclass
 from multiprocessing import Value
 from typing import List
@@ -258,6 +259,143 @@ class GridDistillDataset(Dataset):
 
         self.box_templates = box_templates
 
+    @staticmethod
+    def _bbox_iou(box1, box2):
+        x0 = max(box1[0], box2[0])
+        y0 = max(box1[1], box2[1])
+        x1 = min(box1[2], box2[2])
+        y1 = min(box1[3], box2[3])
+        inter_w = max(0.0, x1 - x0)
+        inter_h = max(0.0, y1 - y0)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+        area1 = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])
+        area2 = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])
+        denom = area1 + area2 - inter_area
+        if denom <= 0:
+            return 0.0
+        return inter_area / denom
+
+    def _get_output_size(self):
+        output_size = self.args.input_size
+        if isinstance(output_size, (tuple, list)):
+            output_size = output_size[0]
+        return int(output_size)
+
+    def _get_patch_size(self):
+        if getattr(self.args, "dcac_patch_size", None):
+            return int(self.args.dcac_patch_size)
+        model_name = getattr(self.args, "model", "").lower()
+        if "16" in model_name:
+            return 16
+        if "14" in model_name:
+            return 14
+        return 16
+
+    @staticmethod
+    def _random_crop_box(img_w, img_h, min_scale=0.4, max_scale=0.9):
+        crop_w = max(2, int(img_w * random.uniform(min_scale, max_scale)))
+        crop_h = max(2, int(img_h * random.uniform(min_scale, max_scale)))
+        if img_w - crop_w <= 0 or img_h - crop_h <= 0:
+            return 0.0, 0.0, float(img_w), float(img_h)
+        x0 = random.randint(0, img_w - crop_w)
+        y0 = random.randint(0, img_h - crop_h)
+        return float(x0), float(y0), float(x0 + crop_w), float(y0 + crop_h)
+
+    def _sample_overlap_pair(self, img_w, img_h, min_iou):
+        max_attempts = 10
+        for _ in range(max_attempts):
+            box1 = self._random_crop_box(img_w, img_h)
+            box1_w = box1[2] - box1[0]
+            box1_h = box1[3] - box1[1]
+            jitter_x = int(random.uniform(-0.3, 0.3) * box1_w)
+            jitter_y = int(random.uniform(-0.3, 0.3) * box1_h)
+            x0 = min(max(0, int(box1[0] + jitter_x)), img_w - int(box1_w))
+            y0 = min(max(0, int(box1[1] + jitter_y)), img_h - int(box1_h))
+            box2 = float(x0), float(y0), float(x0 + box1_w), float(y0 + box1_h)
+            if self._bbox_iou(box1, box2) >= min_iou:
+                return box1, box2
+        return box1, box1
+
+    @staticmethod
+    def _map_to_output_coords(crop_w, crop_h, x0, y0, x1, y1, output_size):
+        scale = output_size / max(crop_h, crop_w)
+        new_w = int(round(crop_w * scale))
+        new_h = int(round(crop_h * scale))
+        pad_w = output_size - new_w
+        pad_h = output_size - new_h
+        pad_left = pad_w // 2
+        pad_top = pad_h // 2
+        x0_out = x0 * scale + pad_left
+        x1_out = x1 * scale + pad_left
+        y0_out = y0 * scale + pad_top
+        y1_out = y1 * scale + pad_top
+        return x0_out, y0_out, x1_out, y1_out
+
+    def _compute_overlap_meta(self, box1, box2, output_size, patch_size):
+        crop1_w = box1[2] - box1[0]
+        crop1_h = box1[3] - box1[1]
+        crop2_w = box2[2] - box2[0]
+        crop2_h = box2[3] - box2[1]
+        inter_x0 = max(box1[0], box2[0])
+        inter_y0 = max(box1[1], box2[1])
+        inter_x1 = min(box1[2], box2[2])
+        inter_y1 = min(box1[3], box2[3])
+        if inter_x1 <= inter_x0 or inter_y1 <= inter_y0:
+            grid_size = torch.tensor([output_size // patch_size, output_size // patch_size], dtype=torch.long)
+            return {
+                "v1_start": torch.zeros(2, dtype=torch.long),
+                "v2_start": torch.zeros(2, dtype=torch.long),
+                "overlap_size": torch.zeros(2, dtype=torch.long),
+                "grid_size": grid_size,
+                "valid": torch.tensor(False, dtype=torch.bool),
+            }
+        inter1_x0 = inter_x0 - box1[0]
+        inter1_y0 = inter_y0 - box1[1]
+        inter1_x1 = inter_x1 - box1[0]
+        inter1_y1 = inter_y1 - box1[1]
+        inter2_x0 = inter_x0 - box2[0]
+        inter2_y0 = inter_y0 - box2[1]
+        inter2_x1 = inter_x1 - box2[0]
+        inter2_y1 = inter_y1 - box2[1]
+
+        out1 = self._map_to_output_coords(crop1_w, crop1_h, inter1_x0, inter1_y0, inter1_x1, inter1_y1, output_size)
+        out2 = self._map_to_output_coords(crop2_w, crop2_h, inter2_x0, inter2_y0, inter2_x1, inter2_y1, output_size)
+
+        grid_h = output_size // patch_size
+        grid_w = output_size // patch_size
+
+        v1_x0 = max(0, min(grid_w, int(out1[0] // patch_size)))
+        v1_y0 = max(0, min(grid_h, int(out1[1] // patch_size)))
+        v1_x1 = max(0, min(grid_w, int(math.ceil(out1[2] / patch_size))))
+        v1_y1 = max(0, min(grid_h, int(math.ceil(out1[3] / patch_size))))
+
+        v2_x0 = max(0, min(grid_w, int(out2[0] // patch_size)))
+        v2_y0 = max(0, min(grid_h, int(out2[1] // patch_size)))
+        v2_x1 = max(0, min(grid_w, int(math.ceil(out2[2] / patch_size))))
+        v2_y1 = max(0, min(grid_h, int(math.ceil(out2[3] / patch_size))))
+
+        overlap_h = min(v1_y1 - v1_y0, v2_y1 - v2_y0)
+        overlap_w = min(v1_x1 - v1_x0, v2_x1 - v2_x0)
+        if overlap_h <= 0 or overlap_w <= 0:
+            grid_size = torch.tensor([grid_h, grid_w], dtype=torch.long)
+            return {
+                "v1_start": torch.zeros(2, dtype=torch.long),
+                "v2_start": torch.zeros(2, dtype=torch.long),
+                "overlap_size": torch.zeros(2, dtype=torch.long),
+                "grid_size": grid_size,
+                "valid": torch.tensor(False, dtype=torch.bool),
+            }
+
+        return {
+            "v1_start": torch.tensor([v1_y0, v1_x0], dtype=torch.long),
+            "v2_start": torch.tensor([v2_y0, v2_x0], dtype=torch.long),
+            "overlap_size": torch.tensor([overlap_h, overlap_w], dtype=torch.long),
+            "grid_size": torch.tensor([grid_h, grid_w], dtype=torch.long),
+            "valid": torch.tensor(True, dtype=torch.bool),
+        }
+
     def _obtain_image_crops(self, image, choice):
         image_crops = []
         img_w, img_h = image.size
@@ -302,6 +440,24 @@ class GridDistillDataset(Dataset):
         if old_image is None:
             next_id = random.choice(range(self.__len__()))
             return self.__getitem__(next_id)
+        if self.args.use_dcac:
+            img_w, img_h = old_image.size
+            box1, box2 = self._sample_overlap_pair(img_w, img_h, self.args.overlap_min_iou)
+            view1 = self.transforms[1](old_image.crop(box1))
+            view2 = self.transforms[1](old_image.crop(box2))
+            output_size = self._get_output_size()
+            patch_size = self._get_patch_size()
+            overlap_meta = self._compute_overlap_meta(box1, box2, output_size, patch_size)
+        else:
+            view1 = torch.empty(0)
+            view2 = torch.empty(0)
+            overlap_meta = {
+                "v1_start": torch.zeros(2, dtype=torch.long),
+                "v2_start": torch.zeros(2, dtype=torch.long),
+                "overlap_size": torch.zeros(2, dtype=torch.long),
+                "grid_size": torch.zeros(2, dtype=torch.long),
+                "valid": torch.tensor(False, dtype=torch.bool),
+            }
         new_image = self.transforms[0](old_image)
         scale = get_scale(old_image, new_image)
         boxes_template = torch.zeros(self.max_anns, 4 + 1)   
@@ -316,9 +472,12 @@ class GridDistillDataset(Dataset):
         boxes_template[:boxes.shape[0], 4] = 1.0
         image_crops_template[:boxes.shape[0]] = image_crops
         if self.args.precompute_knn:
+            if self.args.use_dcac:
+                return new_image, boxes_template, image_crops_template, proxy_image, view1, view2, overlap_meta, image_id
             return new_image, boxes_template, image_crops_template, proxy_image, image_id
-        else:
-            return new_image, boxes_template, image_crops_template, proxy_image
+        if self.args.use_dcac:
+            return new_image, boxes_template, image_crops_template, proxy_image, view1, view2, overlap_meta
+        return new_image, boxes_template, image_crops_template, proxy_image
         
 
 class COCOPanopticDataset(Dataset):
@@ -403,7 +562,7 @@ class COCOPanopticDataset(Dataset):
                 continue
             image_crops[i] = self.transforms[1](old_image.crop((x0, y0, x1, y1)))   # image crops
             # masked image crop
-            np_old_image = np.asarray(old_image.copy())
+            np_old_image = np.asarray(old_image.copy()).copy()
             np_old_image[segm_map != ann['id']] = 114
             masked_old_image = Image.fromarray(np_old_image)
             masked_image_crops[i] = self.transforms[1](masked_old_image.crop((x0, y0, x1, y1)))   # image crops

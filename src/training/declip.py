@@ -1,10 +1,34 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from training.misc import is_main_process
-import torch
+from training.dcac_loss import compute_dcac_loss
 
 
 class DeCLIP:
+    def _encode_patch_tokens(self, model, images):
+        visual = model.visual if hasattr(model, "visual") else model.vision_model
+        patch_dropout = getattr(visual, "patch_dropout", None)
+        if patch_dropout is not None and not isinstance(patch_dropout, nn.Identity):
+            visual.patch_dropout = nn.Identity()
+            try:
+                tokens = visual(images, return_all_features=True)
+            except TypeError:
+                tokens = visual.forward(images, return_all_features=True)
+            finally:
+                visual.patch_dropout = patch_dropout
+        else:
+            try:
+                tokens = visual(images, return_all_features=True)
+            except TypeError:
+                tokens = visual.forward(images, return_all_features=True)
+        if tokens.dim() != 3:
+            raise ValueError("Expected token sequence output for DCAC features.")
+        tokens = tokens[:, 1:, :]
+        if hasattr(visual, "norm"):
+            tokens = visual.norm(tokens)
+        return tokens
+
     def __call__(self, batch, student, teacher, vfm_model, args):
         losses={}
         context_weight = args.loss_context_weight
@@ -13,11 +37,27 @@ class DeCLIP:
             student = student.module
         dtype_map = {"bf16": torch.bfloat16, "amp": torch.float16}
         input_dtype = dtype_map.get(args.precision, torch.float32)
-        images, normed_boxes, image_crops, proxy_image = batch
+        images_view1 = None
+        images_view2 = None
+        overlap_meta = None
+        if len(batch) == 4:
+            images, normed_boxes, image_crops, proxy_image = batch
+        elif len(batch) == 5:
+            images, normed_boxes, image_crops, proxy_image, _ = batch
+        elif len(batch) == 7:
+            images, normed_boxes, image_crops, proxy_image, images_view1, images_view2, overlap_meta = batch
+        elif len(batch) == 8:
+            images, normed_boxes, image_crops, proxy_image, images_view1, images_view2, overlap_meta, _ = batch
+        else:
+            raise ValueError(f"Unexpected batch size for DeCLIP: {len(batch)}")
         images = images.to(device=args.device, dtype=input_dtype, non_blocking=True)  
         normed_boxes = normed_boxes.to(device=args.device, dtype=input_dtype,non_blocking=True)
         image_crops = image_crops.to(device=args.device, dtype=input_dtype,non_blocking=True) 
         proxy_image=proxy_image.to(device=args.device, dtype=input_dtype, non_blocking=True)
+        if args.use_dcac and images_view1 is not None:
+            images_view1 = images_view1.to(device=args.device, dtype=input_dtype, non_blocking=True)
+            images_view2 = images_view2.to(device=args.device, dtype=input_dtype, non_blocking=True)
+            overlap_meta = {k: v.to(device=args.device, non_blocking=True) for k, v in overlap_meta.items()}
 
         rois_list = []
         crops_list = []
@@ -42,6 +82,12 @@ class DeCLIP:
 
         _loss_content = 1.0 - (student_roi_features * teacher_crop_features).sum(-1).mean()
         losses.update({"loss_content":_loss_content * content_weight})
+
+        if args.use_dcac and images_view1 is not None:
+            patch_feat1 = self._encode_patch_tokens(student, images_view1)
+            patch_feat2 = self._encode_patch_tokens(student, images_view2)
+            loss_dcac = compute_dcac_loss(patch_feat1, patch_feat2, overlap_meta, temp=args.dcac_temp)
+            losses.update({"loss_dcac": loss_dcac * args.dcac_weight})
         return losses, len(images)
 
     def get_teacher_context_similarity(self,vfm_model,proxy_image,args):

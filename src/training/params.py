@@ -103,6 +103,31 @@ def parse_args(args):
         type=float,
         default=0.1,
     )
+    parser.add_argument(
+        "--use-dcac",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--dcac-weight",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--dcac-temp",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--overlap-min-iou",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
+        "--dcac-debug",
+        action="store_true",
+        default=False,
+    )
 
     parser.add_argument(
         "--train-ratio",
