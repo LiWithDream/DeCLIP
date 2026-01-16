@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from training.misc import is_main_process
 from training.dcac_loss import compute_dcac_loss

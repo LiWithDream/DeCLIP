@@ -150,8 +150,12 @@ def main(args):
  
     if hasattr(student_model, 'visual'):
         args.input_size = student_model.visual.image_size
+        if args.use_dcac and hasattr(student_model.visual, "patch_embed"):
+            args.dcac_patch_size = student_model.visual.patch_embed.patch_size[0]
     elif hasattr(student_model, 'vision_model'):
         args.input_size = student_model.vision_model.image_size
+        if args.use_dcac and hasattr(student_model.vision_model, "patch_embed"):
+            args.dcac_patch_size = student_model.vision_model.patch_embed.patch_size[0]
     else:
         raise ValueError("student_model must have either 'visual' or 'vision_model' attribute")
 
